@@ -1,0 +1,28 @@
+{
+  "mcpServers": {
+    "weather-api": {
+      "command": "python3",
+      "args": ["-m", "mcp_server.weather_api"]
+    },
+    "flights-api": {
+      "command": "python3",
+      "args": ["-m", "mcp_server.flights_api"]
+    },
+    "maps-api": {
+      "command": "python3",
+      "args": ["-m", "mcp_server.maps_api"]
+    },
+    "hotels-api": {
+      "command": "python3",
+      "args": ["-m", "mcp_server.hotels_api"]
+    },
+    "currency-api": {
+      "command": "python3",
+      "args": ["-m", "mcp_server.currency_api"]
+    },
+    "budget-api": {
+      "command": "python3",
+      "args": ["-m", "mcp_server.budget_api"]
+    }
+  }
+}
