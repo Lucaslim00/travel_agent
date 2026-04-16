@@ -191,5 +191,17 @@ TOOL_HANDLERS = {
 # ── Standalone MCP server entry point ───────────────────────────────────────
 
 if __name__ == "__main__":
-    from mcp_server.mcp_protocol import run_server
-    run_server("currency-api", "1.0.0", TOOLS, TOOL_HANDLERS)
+    from mcp.server.fastmcp import FastMCP
+    _mcp = FastMCP("currency-api")
+
+    @_mcp.tool(name="convert_currency")
+    def _convert_currency(amount: float, from_currency: str, to_currency: str) -> str:
+        """Convert an amount between currencies using REAL-TIME exchange rates. Supports 150+ currencies."""
+        return convert_currency({"amount": amount, "from_currency": from_currency, "to_currency": to_currency})
+
+    @_mcp.tool(name="get_exchange_rate")
+    def _get_exchange_rate(from_currency: str, to_currency: str) -> str:
+        """Get the current exchange rate between two currencies."""
+        return get_exchange_rate({"from_currency": from_currency, "to_currency": to_currency})
+
+    _mcp.run(transport="stdio")

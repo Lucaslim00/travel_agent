@@ -1,6 +1,7 @@
 import streamlit as st
 import streamlit.components.v1 as components
 import anthropic
+import asyncio
 import json
 import logging
 import re
@@ -8,11 +9,11 @@ import requests
 import sys
 import os
 import time as _time
-from collections import defaultdict
 from datetime import datetime
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
 
-# Add project root to path so we can import mcp_server as a package
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -111,47 +112,6 @@ def filter_output(text: str) -> str:
     return text
 
 
-# ── Tool Input Guardrails ────────────────────────────────────────────────────
-
-# Allowed tools and their required/optional params for validation
-_TOOL_PARAM_RULES = {
-    "search_flights": {"required": ["origin", "destination", "departure_date"]},
-    "search_hotels": {"required": ["city"]},
-    "get_temperature": {"required": ["city"]},
-    "convert_currency": {"required": ["amount", "from_currency", "to_currency"]},
-    "get_exchange_rate": {"required": ["from_currency", "to_currency"]},
-    "show_map": {"required": ["city"]},
-    "get_distance": {"required": ["origin", "destination"]},
-    "find_nearby": {"required": ["city", "category"]},
-    "budget_add_item": {"required": ["category", "item", "amount"]},
-    "budget_remove_item": {"required": ["item"]},
-    "budget_get_summary": {"required": []},
-    "budget_clear": {"required": []},
-    "budget_set_currency": {"required": ["currency"]},
-}
-
-
-def validate_tool_call(name: str, params: dict) -> tuple[bool, str]:
-    """Validate tool name and parameters before execution."""
-    # Only allow known tools
-    if name not in _TOOL_PARAM_RULES:
-        logger.warning("BLOCKED unknown tool call: %s", name)
-        return False, f"Unknown tool: {name}"
-
-    # Check required params exist
-    rules = _TOOL_PARAM_RULES[name]
-    for param in rules["required"]:
-        if param not in params or params[param] is None:
-            logger.warning("BLOCKED tool %s — missing required param: %s", name, param)
-            return False, f"Missing required parameter: {param}"
-
-    # Sanitize string params (strip HTML/script injection in tool inputs)
-    for key, value in params.items():
-        if isinstance(value, str):
-            params[key] = re.sub(r"<\s*\/?\s*(script|iframe|object|embed)\b[^>]*>", "", value, flags=re.IGNORECASE)
-
-    return True, ""
-
 # ── Logging Setup ──────────────────────────────────────────────────────────
 
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
@@ -168,12 +128,99 @@ logging.basicConfig(
 )
 logger = logging.getLogger("tina.mcp")
 
-from mcp_server.fetch_weather import get_temperature
-from mcp_server.fetch_flights import search_flights
-from mcp_server.display_map import show_map, get_distance, find_nearby
-from mcp_server.fetch_hotels import search_hotels
-from mcp_server.fetch_currency import convert_currency, get_exchange_rate
-from mcp_server.track_budget import add_item, remove_item, get_summary, clear_items
+# ── MCP Server Configuration ──────────────────────────────────────────────
+
+PYTHON = sys.executable
+
+MCP_SERVERS = {
+    "flights":  {"args": ["-m", "mcp_server.fetch_flights"]},
+    "weather":  {"args": ["-m", "mcp_server.fetch_weather"]},
+    "hotels":   {"args": ["-m", "mcp_server.fetch_hotels"]},
+    "maps":     {"args": ["-m", "mcp_server.display_map"]},
+    "currency": {"args": ["-m", "mcp_server.fetch_currency"]},
+    "budget":   {"args": ["-m", "mcp_server.track_budget"]},
+}
+
+# Build tool-name → server-name lookup once tools are discovered
+# e.g. {"search_flights": "flights", "budget_add_item": "budget", ...}
+_TOOL_TO_SERVER: dict[str, str] = {}
+
+
+def _discover_tools_sync() -> list[dict]:
+    """Connect to every MCP server, list tools, return Anthropic-format tool defs."""
+
+    async def _discover():
+        all_tools = []
+        for server_name, cfg in MCP_SERVERS.items():
+            params = StdioServerParameters(
+                command=PYTHON,
+                args=cfg["args"],
+                env={"PYTHONPATH": PROJECT_DIR, "PATH": os.environ.get("PATH", "")},
+            )
+            try:
+                async with stdio_client(params) as (read, write):
+                    async with ClientSession(read, write) as session:
+                        await session.initialize()
+                        result = await session.list_tools()
+                        for t in result.tools:
+                            _TOOL_TO_SERVER[t.name] = server_name
+                            all_tools.append({
+                                "name": t.name,
+                                "description": t.description or "",
+                                "input_schema": t.inputSchema,
+                            })
+            except Exception as e:
+                logger.error("Failed to discover tools from %s: %s", server_name, e)
+        return all_tools
+
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(_discover())
+    finally:
+        loop.close()
+
+
+def _call_mcp_tool_sync(tool_name: str, tool_input: dict) -> str:
+    """Call a tool on the appropriate MCP server. Returns JSON string."""
+
+    server_name = _TOOL_TO_SERVER.get(tool_name)
+    if not server_name:
+        return json.dumps({"error": f"Unknown tool: {tool_name}"})
+
+    cfg = MCP_SERVERS[server_name]
+
+    async def _call():
+        params = StdioServerParameters(
+            command=PYTHON,
+            args=cfg["args"],
+            env={"PYTHONPATH": PROJECT_DIR, "PATH": os.environ.get("PATH", "")},
+        )
+        async with stdio_client(params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                result = await session.call_tool(tool_name, tool_input)
+                # MCP returns content blocks; extract text
+                for block in result.content:
+                    if hasattr(block, "text"):
+                        return block.text
+                return json.dumps({"error": "No text content in MCP response"})
+
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(_call())
+    finally:
+        loop.close()
+
+
+# Discover tools at startup and cache in session state
+if "mcp_tools" not in st.session_state:
+    st.session_state.mcp_tools = _discover_tools_sync()
+    st.session_state.mcp_tool_to_server = dict(_TOOL_TO_SERVER)
+else:
+    # Restore the module-level lookup from session state
+    _TOOL_TO_SERVER.update(st.session_state.mcp_tool_to_server)
+
+TOOLS = st.session_state.mcp_tools
 
 st.set_page_config(page_title="Tina - Travel Assistant Agent", page_icon="✈️", layout="wide")
 
@@ -499,209 +546,46 @@ def _build_system_prompt() -> str:
 
     return base_prompt + location_context + budget_summary + workflow_reminder
 
-# ── Tool Definitions (Anthropic API format) ─────────────────────────────────
 
-TOOLS = [
-    {
-        "name": "search_flights",
-        "description": "Search for REAL flights using Google Flights. Returns live prices, airlines, durations, stops, carbon emissions. REQUIRES IATA airport codes.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "origin": {"type": "string", "description": "Departure IATA airport code (e.g., 'JFK', 'LAX', 'SIN', 'KUL')"},
-                "destination": {"type": "string", "description": "Arrival IATA airport code (e.g., 'NRT', 'CDG', 'LHR')"},
-                "departure_date": {"type": "string", "description": "Departure date (YYYY-MM-DD)"},
-                "return_date": {"type": "string", "description": "Return date (YYYY-MM-DD, omit for one-way)"},
-                "passengers": {"type": "integer", "description": "Number of adult passengers (default: 1)", "default": 1},
-                "seat_class": {"type": "string", "enum": ["economy", "premium-economy", "business", "first"], "default": "economy"},
-                "max_stops": {"type": "integer", "description": "Maximum stops allowed. Omit for any."},
-                "currency": {"type": "string", "description": "Currency for prices (default: USD)", "default": "USD"},
-            },
-            "required": ["origin", "destination", "departure_date"],
-        },
-    },
-    {
-        "name": "search_hotels",
-        "description": "Search for REAL hotels using Google Hotels. Returns live per-night prices, star ratings, guest ratings, review counts, deal labels, and website links. Price is per night — estimated_total is calculated as price_per_night × nights.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "city": {"type": "string", "description": "City to search (e.g., 'Paris, France')"},
-                "check_in": {"type": "string", "description": "Check-in date (YYYY-MM-DD)"},
-                "check_out": {"type": "string", "description": "Check-out date (YYYY-MM-DD)"},
-                "budget": {"type": "string", "enum": ["budget", "mid-range", "luxury"], "default": "mid-range"},
-                "currency": {"type": "string", "description": "Currency code for prices (default: USD)", "default": "USD"},
-                "limit": {"type": "integer", "description": "Max results (default: 5)", "default": 5},
-            },
-            "required": ["city"],
-        },
-    },
-    {
-        "name": "get_temperature",
-        "description": "Getches temperature forecasts based on historical averages for distant future dates.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "city": {"type": "string", "description": "City name (e.g., 'Barcelona, Spain')"},
-                "date": {"type": "string", "description": "Date to get temperature for (YYYY-MM-DD). Defaults to today if omitted."},
-                "end_date": {"type": "string", "description": "Optional end date (YYYY-MM-DD) for a multi-day range. If omitted, returns only the single date."},
-            },
-            "required": ["city"],
-        },
-    },
-    {
-        "name": "convert_currency",
-        "description": "Convert an amount between currencies using REAL-TIME exchange rates from open.er-api.com. Supports 150+ currencies.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "amount": {"type": "number", "description": "Amount to convert"},
-                "from_currency": {"type": "string", "description": "Source currency code (e.g., 'USD')"},
-                "to_currency": {"type": "string", "description": "Target currency code (e.g., 'EUR')"},
-            },
-            "required": ["amount", "from_currency", "to_currency"],
-        },
-    },
-    {
-        "name": "get_exchange_rate",
-        "description": "Get the current exchange rate between two currencies without converting a specific amount.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "from_currency": {"type": "string", "description": "Base currency code (e.g., 'USD')"},
-                "to_currency": {"type": "string", "description": "Target currency code (e.g., 'JPY')"},
-            },
-            "required": ["from_currency", "to_currency"],
-        },
-    },
-    {
-        "name": "show_map",
-        "description": "Display an interactive map with multiple pins. Pass pins array with lat, lng, label for each location (attractions, hotels, restaurants).",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "city": {"type": "string", "description": "City for map center (e.g., 'Hanoi, Vietnam')"},
-                "zoom": {"type": "integer", "description": "Zoom level 1-20 (default: 13)", "default": 13},
-                "map_type": {"type": "string", "enum": ["roadmap", "satellite"], "default": "roadmap"},
-                "pins": {
-                    "type": "array",
-                    "description": "Locations to pin on the map",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "lat": {"type": "number", "description": "Latitude"},
-                            "lng": {"type": "number", "description": "Longitude"},
-                            "label": {"type": "string", "description": "Pin label"},
-                        },
-                        "required": ["lat", "lng", "label"],
-                    },
-                },
-            },
-            "required": ["city"],
-        },
-    },
-    {
-        "name": "get_distance",
-        "description": "Calculate REAL distance and travel time between two locations using Google Distance Matrix.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "origin": {"type": "string", "description": "Starting location"},
-                "destination": {"type": "string", "description": "Ending location"},
-                "mode": {"type": "string", "enum": ["walking", "driving", "transit"], "default": "walking"},
-            },
-            "required": ["origin", "destination"],
-        },
-    },
-    {
-        "name": "find_nearby",
-        "description": "Find REAL nearby places using Google Places API. Returns names, ratings, addresses.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "city": {"type": "string", "description": "City to search in"},
-                "category": {"type": "string", "enum": ["attractions", "restaurants", "hotels", "shopping", "nightlife", "museums"]},
-                "limit": {"type": "integer", "description": "Max results (default: 5)", "default": 5},
-            },
-            "required": ["city", "category"],
-        },
-    },
-    {
-        "name": "budget_add_item",
-        "description": "Add a cost item to the trip budget panel.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "category": {"type": "string", "description": "Budget category (e.g., 'Flights', 'Accommodation', 'Food', 'Activities', 'Transport')"},
-                "item": {"type": "string", "description": "Description of the item"},
-                "amount": {"type": "number", "description": "Cost amount in the user's selected currency"},
-            },
-            "required": ["category", "item", "amount"],
-        },
-    },
-    {
-        "name": "budget_remove_item",
-        "description": "Remove an item from the budget by name (partial match).",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "item": {"type": "string", "description": "Name of the item to remove"},
-            },
-            "required": ["item"],
-        },
-    },
-    {
-        "name": "budget_get_summary",
-        "description": "Get the current budget breakdown.",
-        "input_schema": {"type": "object", "properties": {}},
-    },
-    {
-        "name": "budget_clear",
-        "description": "Clear all items from the budget.",
-        "input_schema": {"type": "object", "properties": {}},
-    },
-]
-
-
-# ── Tool Router ─────────────────────────────────────────────────────────────
-
+# ── Tool Execution via MCP ─────────────────────────────────────────────────
 
 def execute_tool(name: str, tool_input: dict) -> str:
-    """Route tool calls to the correct handler, with logging."""
+    """Call a tool via its MCP server, with logging and side-effect handling."""
 
     logger.info("=" * 70)
     logger.info("TOOL CALL: %s", name)
     logger.info("INPUT: %s", json.dumps(tool_input, indent=2))
 
     start_time = datetime.now()
-    result = _route_tool(name, tool_input)
+    result = _call_mcp_tool_sync(name, tool_input)
     elapsed = (datetime.now() - start_time).total_seconds()
 
-    # Log output (truncate if very long)
     output_preview = result[:2000] if len(result) > 2000 else result
     logger.info("OUTPUT (%s, %.2fs): %s", name, elapsed, output_preview)
     if len(result) > 2000:
         logger.info("  ... (truncated, full output is %d chars)", len(result))
     logger.info("=" * 70)
 
-    return result
+    # ── Side effects: mirror budget state into session ─────────────────
+    if name == "budget_add_item":
+        st.session_state.budget_items.append({
+            "category": tool_input.get("category", "Other"),
+            "item": tool_input.get("item", ""),
+            "amount": tool_input.get("amount", 0),
+        })
+    elif name == "budget_remove_item":
+        remove_name = tool_input.get("item", "").lower()
+        st.session_state.budget_items = [
+            i for i in st.session_state.budget_items
+            if remove_name not in i["item"].lower()
+        ]
+    elif name == "budget_clear":
+        st.session_state.budget_items = []
 
-
-def _route_tool(name: str, tool_input: dict) -> str:
-    """Route tool calls to the correct handler."""
-
-    # ── Imported from MCP modules ───────────────────────────────────────
-    if name == "search_flights":
-        return search_flights(tool_input)
-
-    elif name == "get_temperature":
-        return get_temperature(tool_input)
-
-    elif name == "show_map":
-        result_str = show_map(tool_input)
-        # Extract map HTML for inline rendering
+    # ── Side effects: capture map HTML for inline rendering ────────────
+    if name == "show_map":
         try:
-            result_data = json.loads(result_str)
+            result_data = json.loads(result)
             if "_map_html" in result_data:
                 st.session_state.pending_maps.append({
                     "city": result_data.get("city", ""),
@@ -709,46 +593,8 @@ def _route_tool(name: str, tool_input: dict) -> str:
                 })
         except (json.JSONDecodeError, KeyError):
             pass
-        return result_str
 
-    elif name == "get_distance":
-        return get_distance(tool_input)
-
-    elif name == "find_nearby":
-        return find_nearby(tool_input)
-
-    # ── Imported from MCP modules (hotels + currency) ────────────────
-    elif name == "search_hotels":
-        return search_hotels(tool_input)
-
-    elif name == "convert_currency":
-        return convert_currency(tool_input)
-
-    elif name == "get_exchange_rate":
-        return get_exchange_rate(tool_input)
-
-    # ── Budget tools ────────────────────────────────────────────────────
-    elif name == "budget_add_item":
-        st.session_state.budget_items, result = add_item(
-            st.session_state.budget_items, st.session_state.budget_currency, tool_input
-        )
-        return result
-
-    elif name == "budget_remove_item":
-        st.session_state.budget_items, result = remove_item(
-            st.session_state.budget_items, st.session_state.budget_currency, tool_input
-        )
-        return result
-
-    elif name == "budget_get_summary":
-        return get_summary(st.session_state.budget_items, st.session_state.budget_currency)
-
-    elif name == "budget_clear":
-        result = clear_items(st.session_state.budget_items, st.session_state.budget_currency)
-        st.session_state.budget_items = []
-        return result
-
-    return json.dumps({"error": f"Unknown tool: {name}"})
+    return result
 
 
 # ── Chat (left column) ─────────────────────────────────────────────────────
@@ -818,25 +664,30 @@ with chat_col:
                     "budget_clear": "💰 Clearing budget...",
                 }
 
-                all_text_parts: list[str] = []
+                placeholder = st.empty()
+                status_placeholder = st.empty()
+                assistant_text = ""
                 max_iterations = 50
 
                 for _ in range(max_iterations):
-                    with st.spinner("Tina is thinking..."):
-                        response = client.messages.create(
-                            model="claude-haiku-4-5",
-                            max_tokens=8192,
-                            system=_build_system_prompt(),
-                            tools=TOOLS,
-                            messages=api_messages,
-                        )
+                    status_placeholder.info("Tina is thinking...")
 
-                    # Show any text from this iteration immediately
-                    for block in response.content:
-                        if hasattr(block, "text") and block.text.strip():
-                            filtered_text = filter_output(block.text)
-                            st.markdown(filtered_text, unsafe_allow_html=True)
-                            all_text_parts.append(filtered_text)
+                    # Stream the response for progressive rendering
+                    with client.messages.stream(
+                        model="claude-haiku-4-5",
+                        max_tokens=8192,
+                        system=_build_system_prompt(),
+                        tools=TOOLS,
+                        messages=api_messages,
+                    ) as stream:
+                        for event in stream:
+                            if event.type == "content_block_delta" and hasattr(event.delta, "text"):
+                                assistant_text += event.delta.text
+                                placeholder.markdown(assistant_text, unsafe_allow_html=True)
+
+                        response = stream.get_final_message()
+
+                    status_placeholder.empty()
 
                     if response.stop_reason == "end_turn":
                         break
@@ -847,21 +698,20 @@ with chat_col:
                     tool_results = []
                     for block in assistant_content:
                         if block.type == "tool_use":
-                            # ── Security: Validate tool call before execution ──
-                            tool_ok, tool_err = validate_tool_call(block.name, block.input)
-                            if not tool_ok:
-                                logger.warning("BLOCKED tool call: %s — %s", block.name, tool_err)
-                                result = json.dumps({"error": tool_err})
+                            # Only allow known MCP tools
+                            if block.name not in _TOOL_TO_SERVER:
+                                logger.warning("BLOCKED unknown tool: %s", block.name)
                                 tool_results.append({
                                     "type": "tool_result",
                                     "tool_use_id": block.id,
-                                    "content": result,
+                                    "content": json.dumps({"error": f"Unknown tool: {block.name}"}),
                                 })
                                 continue
 
                             status_msg = _TOOL_STATUS.get(block.name, "🔍 Looking things up...")
-                            with st.spinner(status_msg):
-                                result = execute_tool(block.name, block.input)
+                            status_placeholder.info(status_msg)
+                            result = execute_tool(block.name, block.input)
+                            status_placeholder.empty()
                             tool_results.append({
                                 "type": "tool_result",
                                 "tool_use_id": block.id,
@@ -873,8 +723,10 @@ with chat_col:
 
                     api_messages.append({"role": "user", "content": tool_results})
 
-                # Combine all text for saving to session
-                assistant_text = "\n\n".join(all_text_parts)
+                # Final render with output filtering
+                assistant_text = filter_output(assistant_text)
+                placeholder.markdown(assistant_text, unsafe_allow_html=True)
+                status_placeholder.empty()
 
                 # Render any maps that were generated during this turn
                 for map_data in st.session_state.pending_maps:

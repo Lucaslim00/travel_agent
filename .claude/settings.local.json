@@ -1,7 +1,18 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python3 -c \":*)"
+      "Bash(python3 -c \":*)",
+      "WebSearch",
+      "Bash(pip show:*)",
+      "Bash(pip install:*)",
+      "Bash(python3 -c \"import claude_agent_sdk; print\\(dir\\(claude_agent_sdk\\)\\)\")",
+      "Bash(python3 -c ':*)",
+      "Bash(python3)",
+      "Bash(python3 -m mcp_server.fetch_weather)",
+      "Bash(git checkout:*)",
+      "Bash(python3 -c \"import mcp; print\\(dir\\(mcp\\)\\)\")",
+      "Bash(python3 -c \"from mcp import ClientSession, StdioServerParameters; print\\('OK'\\)\")",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('app.py'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")"
     ]
   }
 }

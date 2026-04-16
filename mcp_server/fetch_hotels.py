@@ -305,5 +305,13 @@ TOOL_HANDLERS = {
 # ── Standalone MCP server entry point ───────────────────────────────────────
 
 if __name__ == "__main__":
-    from mcp_server.mcp_protocol import run_server
-    run_server("hotels-api", "2.0.0", TOOLS, TOOL_HANDLERS)
+    from mcp.server.fastmcp import FastMCP
+    _mcp = FastMCP("hotels-api")
+
+    @_mcp.tool(name="search_hotels")
+    def _search_hotels(city: str, check_in: str = "", check_out: str = "", adults: int = 2, budget: str = "mid-range", currency: str = "USD", limit: int = 5) -> str:
+        """Search for REAL hotels using Google Hotels. Returns live per-night prices, star ratings, guest ratings, review counts, deal labels, and website links."""
+        params = {"city": city, "check_in": check_in, "check_out": check_out, "adults": adults, "budget": budget, "currency": currency, "limit": limit}
+        return search_hotels(params)
+
+    _mcp.run(transport="stdio")

@@ -427,5 +427,25 @@ TOOL_HANDLERS = {
 # ── Standalone MCP server entry point ───────────────────────────────────────
 
 if __name__ == "__main__":
-    from mcp_server.mcp_protocol import run_server
-    run_server("maps-api", "2.0.0", TOOLS, TOOL_HANDLERS)
+    from mcp.server.fastmcp import FastMCP
+    _mcp = FastMCP("maps-api")
+
+    @_mcp.tool(name="show_map")
+    def _show_map(city: str, zoom: int = 13, map_type: str = "roadmap", pins: list = None) -> str:
+        """Display an interactive map with multiple pins. Pass pins array with lat, lng, label for each location."""
+        params = {"city": city, "zoom": zoom, "map_type": map_type}
+        if pins:
+            params["pins"] = pins
+        return show_map(params)
+
+    @_mcp.tool(name="get_distance")
+    def _get_distance(origin: str, destination: str, mode: str = "walking") -> str:
+        """Calculate REAL distance and travel time between two locations."""
+        return get_distance({"origin": origin, "destination": destination, "mode": mode})
+
+    @_mcp.tool(name="find_nearby")
+    def _find_nearby(city: str, category: str, limit: int = 5) -> str:
+        """Find REAL nearby places using OpenStreetMap. Returns names, ratings, addresses."""
+        return find_nearby({"city": city, "category": category, "limit": limit})
+
+    _mcp.run(transport="stdio")

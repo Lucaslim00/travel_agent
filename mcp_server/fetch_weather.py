@@ -286,5 +286,17 @@ TOOL_HANDLERS = {
 # ── Standalone MCP server entry point ───────────────────────────────────────
 
 if __name__ == "__main__":
-    from mcp_server.mcp_protocol import run_server
-    run_server("weather-api", "2.0.0", TOOLS, TOOL_HANDLERS)
+    from mcp.server.fastmcp import FastMCP
+    _mcp = FastMCP("weather-api")
+
+    @_mcp.tool(name="get_temperature")
+    def _get_temperature(city: str, date: str = "", end_date: str = "") -> str:
+        """Fetches temperature forecasts based on historical averages for distant future dates."""
+        params = {"city": city}
+        if date:
+            params["date"] = date
+        if end_date:
+            params["end_date"] = end_date
+        return get_temperature(params)
+
+    _mcp.run(transport="stdio")

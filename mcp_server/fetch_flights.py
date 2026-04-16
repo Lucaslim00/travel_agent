@@ -520,5 +520,17 @@ TOOL_HANDLERS = {
 # ── Standalone MCP server entry point ───────────────────────────────────────
 
 if __name__ == "__main__":
-    from mcp_server.mcp_protocol import run_server
-    run_server("flights-api", "2.0.0", TOOLS, TOOL_HANDLERS)
+    from mcp.server.fastmcp import FastMCP
+    _mcp = FastMCP("flights-api")
+
+    @_mcp.tool(name="search_flights")
+    def _search_flights(origin: str, destination: str, departure_date: str, return_date: str = "", passengers: int = 1, seat_class: str = "economy", max_stops: int = -1, currency: str = "USD") -> str:
+        """Search for REAL flights using Google Flights. Returns live prices, airlines, durations, stops, carbon emissions. REQUIRES IATA airport codes."""
+        params = {"origin": origin, "destination": destination, "departure_date": departure_date, "passengers": passengers, "seat_class": seat_class, "currency": currency}
+        if return_date:
+            params["return_date"] = return_date
+        if max_stops >= 0:
+            params["max_stops"] = max_stops
+        return search_flights(params)
+
+    _mcp.run(transport="stdio")

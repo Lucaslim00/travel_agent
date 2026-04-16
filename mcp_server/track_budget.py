@@ -157,5 +157,32 @@ TOOL_HANDLERS = {
 
 
 if __name__ == "__main__":
-    from mcp_server.mcp_protocol import run_server
-    run_server("budget-api", "1.0.0", TOOLS, TOOL_HANDLERS)
+    from mcp.server.fastmcp import FastMCP
+    _mcp = FastMCP("budget-api")
+
+    @_mcp.tool(name="budget_add_item")
+    def _fastmcp_add(category: str, item: str, amount: float) -> str:
+        """Add a cost item to the trip budget panel."""
+        return _mcp_add({"category": category, "item": item, "amount": amount})
+
+    @_mcp.tool(name="budget_remove_item")
+    def _fastmcp_remove(item: str) -> str:
+        """Remove an item from the budget by name (partial match)."""
+        return _mcp_remove({"item": item})
+
+    @_mcp.tool(name="budget_get_summary")
+    def _fastmcp_summary() -> str:
+        """Get the current budget breakdown."""
+        return _mcp_summary({})
+
+    @_mcp.tool(name="budget_clear")
+    def _fastmcp_clear() -> str:
+        """Clear all items from the budget."""
+        return _mcp_clear({})
+
+    @_mcp.tool(name="budget_set_currency")
+    def _fastmcp_set_currency(currency: str) -> str:
+        """Set the budget currency."""
+        return _mcp_set_currency({"currency": currency})
+
+    _mcp.run(transport="stdio")
